@@ -528,9 +528,8 @@ extension SQLiteHistory: Favicons {
     }
 
     func getFaviconsForBookmarkedURL(url: String) -> Deferred<Maybe<Cursor<Favicon?>>> {
-        let sql = "SELECT \(TableFavicons).id AS id, \(TableFavicons).url AS url, \(TableFavicons).date AS date, \(TableFavicons).type AS type, \(TableFavicons).width AS width FROM \(TableFavicons), \(TableBookmarks) WHERE \(TableBookmarks).faviconID = \(TableFavicons).id AND \(TableBookmarks).url IS ?"
-        let args: Args = [url]
-        return db.runQuery(sql, args: args, factory: SQLiteHistory.iconColumnFactory)
+        // TODO: no can do.
+        return deferMaybe(Cursor<Favicon?>())
     }
 
     public func clearAllFavicons() -> Success {
@@ -580,12 +579,6 @@ extension SQLiteHistory: Favicons {
                 if let err = err {
                     log.error("Got error adding icon: \(err).")
                     return 0
-                }
-
-                // Try to update the favicon ID column in the bookmarks table as well for this favicon
-                // if this site has been bookmarked
-                if let id = id {
-                    conn.executeChange("UPDATE \(TableBookmarks) SET faviconID = ? WHERE url = ?", withArgs: [id, site.url])
                 }
 
                 return id ?? 0

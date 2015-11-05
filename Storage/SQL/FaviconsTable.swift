@@ -93,8 +93,6 @@ class FaviconsTable<T>: GenericTable<Favicon> {
         return ("DELETE FROM \(TableFavicons) " +
             "WHERE \(TableFavicons).id NOT IN (" +
                 "SELECT faviconID FROM \(TableFaviconSites) " +
-                "UNION ALL " +
-                "SELECT faviconID FROM \(TableBookmarks) WHERE faviconID IS NOT NULL" +
             ")", nil)
     }
 }

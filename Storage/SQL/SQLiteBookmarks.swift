@@ -180,7 +180,8 @@ public class SQLiteBookmarks: BookmarksModelFactory {
     private func getChildrenWhere(whereClause: String, args: Args, includeIcon: Bool) -> Cursor<BookmarkNode> {
         var err: NSError? = nil
         return db.withReadableConnection(&err) { (conn, err) -> Cursor<BookmarkNode> in
-            let inner = "SELECT id, type, guid, url, title, faviconID FROM \(TableBookmarks) WHERE \(whereClause)"
+            // TODO: figure out how to do favicons now.
+            let inner = "SELECT id, type, guid, bmkUri AS url, title, -1 AS faviconID FROM \(TableBookmarksLocal) WHERE \(whereClause)"
 
             let sql: String
             if includeIcon {
@@ -205,7 +206,7 @@ public class SQLiteBookmarks: BookmarksModelFactory {
 
     private func getChildren(guid: String) -> Cursor<BookmarkNode> {
         let args: Args = [guid]
-        let sql = "parent IS NOT NULL AND parent = (SELECT id FROM \(TableBookmarks) WHERE guid = ?)"
+        let sql = "parent IS NOT NULL AND parent = (SELECT id FROM \(TableBookmarksLocal) WHERE guid = ?)"
         return self.getChildrenWhere(sql, args: args, includeIcon: true)
     }
 
@@ -259,7 +260,7 @@ public class SQLiteBookmarks: BookmarksModelFactory {
 
     public func isBookmarked(url: String) -> Deferred<Maybe<Bool>> {
         var err: NSError?
-        let sql = "SELECT id FROM \(TableBookmarks) WHERE url = ? LIMIT 1"
+        let sql = "SELECT id FROM \(TableBookmarksLocal) UNION ALL \(TableBookmarksMirror) WHERE bmkUri = ? LIMIT 1"
         let args: Args = [url]
 
         let c = db.withReadableConnection(&err) { (conn, err) -> Cursor<Int> in
@@ -272,27 +273,30 @@ public class SQLiteBookmarks: BookmarksModelFactory {
         return deferMaybe(DatabaseError(err: err))
     }
 
+    // TODO: rewrite me.
     public func clearBookmarks() -> Success {
         return self.db.run([
-            ("DELETE FROM \(TableBookmarks) WHERE parent IS NOT ?", [BookmarkRoots.RootID]),
+            ("DELETE FROM \(TableBookmarksLocal) WHERE parent IS NOT ?", [BookmarkRoots.RootID]),
             self.favicons.getCleanupCommands()
         ])
     }
 
+    // TODO: rewrite me.
     public func removeByURL(url: String) -> Success {
         return self.db.run([
-            ("DELETE FROM \(TableBookmarks) WHERE url = ?", [url]),
+            ("DELETE FROM \(TableBookmarksLocal) WHERE url = ?", [url]),
         ])
     }
 
+    // TODO: rewrite me.
     public func remove(bookmark: BookmarkNode) -> Success {
         let sql: String
         let args: Args
         if let id = bookmark.id {
-            sql = "DELETE FROM \(TableBookmarks) WHERE id = ?"
+            sql = "DELETE FROM \(TableBookmarksLocal) WHERE id = ?"
             args = [id]
         } else {
-            sql = "DELETE FROM \(TableBookmarks) WHERE guid = ?"
+            sql = "DELETE FROM \(TableBookmarksLocal) WHERE guid = ?"
             args = [bookmark.guid]
         }
 
@@ -303,48 +307,27 @@ public class SQLiteBookmarks: BookmarksModelFactory {
 }
 
 extension SQLiteBookmarks: ShareToDestination {
-    public func addToMobileBookmarks(url: NSURL, title: String, favicon: Favicon?) -> Success {
+    public func addToMobileBookmarks(url: NSURL, title: String) -> Success {
         var err: NSError?
 
         return self.db.withWritableConnection(&err) {  (conn, err) -> Success in
-            func insertBookmark(icon: Int) -> Success {
-                log.debug("Inserting bookmark with specified icon \(icon).")
-                let urlString = url.absoluteString
-                var args: Args = [
-                    Bytes.generateGUID(),
-                    BookmarkNodeType.Bookmark.rawValue,
-                    urlString,
-                    title,
-                    BookmarkRoots.MobileID,
-                ]
+            let urlString = url.absoluteString
+            let args: Args = [
+                Bytes.generateGUID(),
+                BookmarkNodeType.Bookmark.rawValue,
+                urlString,
+                title,
+                BookmarkRoots.MobileID,
+            ]
 
-                // If the caller didn't provide an icon (and they usually don't!),
-                // do a reverse lookup in history. We use a view to make this simple.
-                let iconValue: String
-                if icon == -1 {
-                    iconValue = "(SELECT iconID FROM \(ViewIconForURL) WHERE url = ?)"
-                    args.append(urlString)
-                } else {
-                    iconValue = "?"
-                    args.append(icon)
-                }
-
-                let sql = "INSERT INTO \(TableBookmarks) (guid, type, url, title, parent, faviconID) VALUES (?, ?, ?, ?, ?, \(iconValue))"
-                err = conn.executeChange(sql, withArgs: args)
-                if let err = err {
-                    log.error("Error inserting \(urlString). Got \(err).")
-                    return deferMaybe(DatabaseError(err: err))
-                }
-                return succeed()
+            // TODO: local modified time.
+            let sql = "INSERT INTO \(TableBookmarksLocal) (guid, type, bmkUri, title, parent) VALUES (?, ?, ?, ?, ?)"
+            err = conn.executeChange(sql, withArgs: args)
+            if let err = err {
+                log.error("Error inserting \(urlString). Got \(err).")
+                return deferMaybe(DatabaseError(err: err))
             }
-
-            // Insert the favicon.
-            if let icon = favicon {
-                if let id = self.favicons.insertOrUpdate(conn, obj: icon) {
-                	return insertBookmark(id)
-                }
-            }
-            return insertBookmark(-1)
+            return succeed()
         }
     }
 
@@ -352,7 +335,7 @@ extension SQLiteBookmarks: ShareToDestination {
         // We parse here in anticipation of getting real URLs at some point.
         if let url = item.url.asURL {
             let title = item.title ?? url.absoluteString
-            self.addToMobileBookmarks(url, title: title, favicon: item.favicon)
+            self.addToMobileBookmarks(url, title: title)
         }
     }
 }
@@ -361,12 +344,7 @@ extension SQLiteBookmarks: ShareToDestination {
 // TODO: also search mirrored bookmarks.
 extension SQLiteBookmarks: SearchableBookmarks {
     public func bookmarksByURL(url: NSURL) -> Deferred<Maybe<Cursor<BookmarkItem>>> {
-        let inner = "SELECT id, type, guid, url, title, faviconID FROM \(TableBookmarks) WHERE type = \(BookmarkNodeType.Bookmark.rawValue) AND url = ?"
-        let sql =
-        "SELECT bookmarks.id AS id, bookmarks.type AS type, guid, bookmarks.url AS url, title, " +
-        "favicons.url AS iconURL, favicons.date AS iconDate, favicons.type AS iconType " +
-        "FROM (\(inner)) AS bookmarks " +
-        "LEFT OUTER JOIN favicons ON bookmarks.faviconID = favicons.id"
+        let sql = "SELECT id, type, guid, bmkUri AS url, title FROM \(TableBookmarksLocal) WHERE type = \(BookmarkNodeType.Bookmark.rawValue) AND bmkUri = ?"
         let args: Args = [url.absoluteString]
         return db.runQuery(sql, args: args, factory: LocalBookmarkNodeFactory.itemFactory)
     }
