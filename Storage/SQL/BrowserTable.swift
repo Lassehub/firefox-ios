@@ -11,9 +11,14 @@ let BookmarksFolderTitleMenu = NSLocalizedString("Bookmarks Menu", tableName: "S
 let BookmarksFolderTitleToolbar = NSLocalizedString("Bookmarks Toolbar", tableName: "Storage", comment: "The name of the folder that contains desktop bookmarks in the toolbar. This should match bookmarks.folder.toolbar.label on Android.")
 let BookmarksFolderTitleUnsorted = NSLocalizedString("Unsorted Bookmarks", tableName: "Storage", comment: "The name of the folder that contains unsorted desktop bookmarks. This should match bookmarks.folder.unfiled.label on Android.")
 
-let TableBookmarks = "bookmarks"
+let _TableBookmarks = "bookmarks"                                      // Removed in v12. Kept for migration.
 let TableBookmarksMirror = "bookmarksMirror"                           // Added in v9.
 let TableBookmarksMirrorStructure = "bookmarksMirrorStructure"         // Added in v10.
+
+let TableBookmarksBuffer = "bookmarksBuffer"                           // Added in v12. bookmarksMirror is renamed to bookmarksBuffer.
+let TableBookmarksBufferStructure = "bookmarksBufferStructure"         // Added in v12.
+let TableBookmarksLocal = "bookmarksLocal"                             // Added in v12. Supersedes 'bookmarks'.
+let TableBookmarksLocalStructure = "bookmarksLocalStructure"           // Added in v12.
 
 let TableFavicons = "favicons"
 let TableHistory = "history"
@@ -31,6 +36,8 @@ let IndexHistoryShouldUpload = "idx_history_should_upload"
 let IndexVisitsSiteIDDate = "idx_visits_siteID_date"                   // Removed in v6.
 let IndexVisitsSiteIDIsLocalDate = "idx_visits_siteID_is_local_date"   // Added in v6.
 let IndexBookmarksMirrorStructureParentIdx = "idx_bookmarksMirrorStructure_parent_idx"   // Added in v10.
+let IndexBookmarksLocalStructureParentIdx = "idx_bookmarksLocalStructure_parent_idx"     // Added in v12.
+let IndexBookmarksBufferStructureParentIdx = "idx_bookmarksBufferStructure_parent_idx"   // Added in v12.
 
 private let AllTables: Args = [
     TableDomains,
@@ -41,7 +48,10 @@ private let AllTables: Args = [
     TableVisits,
     TableCachedTopSites,
 
-    TableBookmarks,
+    TableBookmarksBuffer,
+    TableBookmarksBufferStructure,
+    TableBookmarksLocal,
+    TableBookmarksLocalStructure,
     TableBookmarksMirror,
     TableBookmarksMirrorStructure,
 
@@ -57,6 +67,8 @@ private let AllViews: Args = [
 private let AllIndices: Args = [
     IndexHistoryShouldUpload,
     IndexVisitsSiteIDIsLocalDate,
+    IndexBookmarksBufferStructureParentIdx,
+    IndexBookmarksLocalStructureParentIdx,
     IndexBookmarksMirrorStructureParentIdx,
 ]
 
@@ -69,7 +81,7 @@ private let log = Logger.syncLogger
  * We rely on SQLiteHistory having initialized the favicon table first.
  */
 public class BrowserTable: Table {
-    static let DefaultVersion = 11
+    static let DefaultVersion = 12
     let version: Int
     var name: String { return "BROWSER" }
     let sqliteVersion: Int32
@@ -118,21 +130,23 @@ public class BrowserTable: Table {
         let type = BookmarkNodeType.Folder.rawValue
         let root = BookmarkRoots.RootID
 
+        // TODO: what's the title of the places root?
         let args: Args = [
-            root, BookmarkRoots.RootGUID, type, "Root", root,
-            BookmarkRoots.MobileID, BookmarkRoots.MobileFolderGUID, type, BookmarksFolderTitleMobile, root,
-            BookmarkRoots.MenuID, BookmarkRoots.MenuFolderGUID, type, BookmarksFolderTitleMenu, root,
-            BookmarkRoots.ToolbarID, BookmarkRoots.ToolbarFolderGUID, type, BookmarksFolderTitleToolbar, root,
-            BookmarkRoots.UnfiledID, BookmarkRoots.UnfiledFolderGUID, type, BookmarksFolderTitleUnsorted, root,
+            root, BookmarkRoots.RootGUID, type, "Root", BookmarkRoots.RootGUID, "Root",
+            BookmarkRoots.MobileID, BookmarkRoots.MobileFolderGUID, type, BookmarksFolderTitleMobile, BookmarkRoots.RootGUID, "Root",
+            BookmarkRoots.MenuID, BookmarkRoots.MenuFolderGUID, type, BookmarksFolderTitleMenu, BookmarkRoots.RootGUID, "Root",
+            BookmarkRoots.ToolbarID, BookmarkRoots.ToolbarFolderGUID, type, BookmarksFolderTitleToolbar, BookmarkRoots.RootGUID, "Root",
+            BookmarkRoots.UnfiledID, BookmarkRoots.UnfiledFolderGUID, type, BookmarksFolderTitleUnsorted, BookmarkRoots.RootGUID, "Root",
         ]
 
+        // TODO: local structure for roots.
         let sql =
-        "INSERT INTO bookmarks (id, guid, type, url, title, parent) VALUES " +
-            "(?, ?, ?, NULL, ?, ?), " +    // Root
-            "(?, ?, ?, NULL, ?, ?), " +    // Mobile
-            "(?, ?, ?, NULL, ?, ?), " +    // Menu
-            "(?, ?, ?, NULL, ?, ?), " +    // Toolbar
-            "(?, ?, ?, NULL, ?, ?)  "      // Unsorted
+        "INSERT INTO bookmarksLocal (id, guid, type, title, parentid, parentName) VALUES " +
+            "(?, ?, ?, ?, ?, ?), " +    // Root
+            "(?, ?, ?, ?, ?, ?), " +    // Mobile
+            "(?, ?, ?, ?, ?, ?), " +    // Menu
+            "(?, ?, ?, ?, ?, ?), " +    // Toolbar
+            "(?, ?, ?, ?, ?, ?)  "      // Unsorted
 
         return self.run(db, sql: sql, args: args)
     }
@@ -195,7 +209,10 @@ public class BrowserTable: Table {
                ") "
     }
 
-    func getBookmarksMirrorTableCreationString(forVersion version: Int = BrowserTable.DefaultVersion) -> String? {
+    let mirrorColumns = ", server_modified INTEGER NOT NULL" +    // Milliseconds.
+                        ", hasDupe TINYINT NOT NULL DEFAULT 0"    // Boolean, 0 (false) if deleted.
+
+    func getBookmarksTableCreationStringForTable(table: String, withAdditionalColumns: String="", forVersion version: Int = BrowserTable.DefaultVersion) -> String? {
         if version < 9 {
             return nil
         }
@@ -203,7 +220,7 @@ public class BrowserTable: Table {
         // The stupid absence of naming conventions here is thanks to pre-Sync Weave. Sorry.
         // For now we have the simplest possible schema: everything in one.
         let sql =
-        "CREATE TABLE IF NOT EXISTS \(TableBookmarksMirror) " +
+        "CREATE TABLE IF NOT EXISTS \(table) " +
 
         // Shared fields.
         "( id INTEGER PRIMARY KEY AUTOINCREMENT" +
@@ -211,10 +228,8 @@ public class BrowserTable: Table {
         ", type TINYINT NOT NULL" +                    // Type enum. TODO: BookmarkNodeType needs to be extended.
 
         // Record/envelope metadata that'll allow us to do merges.
-        ", server_modified INTEGER NOT NULL" +         // Milliseconds.
         ", is_deleted TINYINT NOT NULL DEFAULT 0" +    // Boolean
 
-        ", hasDupe TINYINT NOT NULL DEFAULT 0" +       // Boolean, 0 (false) if deleted.
         ", parentid TEXT" +                            // GUID
         ", parentName TEXT" +
 
@@ -225,6 +240,7 @@ public class BrowserTable: Table {
         ", title TEXT, description TEXT" +             // FOLDERS, BOOKMARKS, QUERIES
         ", bmkUri TEXT, tags TEXT, keyword TEXT" +     // BOOKMARKS, QUERIES
         ", folderName TEXT, queryId TEXT" +            // QUERIES
+        withAdditionalColumns +
         ", CONSTRAINT parentidOrDeleted CHECK (parentid IS NOT NULL OR is_deleted = 1)" +
         ", CONSTRAINT parentNameOrDeleted CHECK (parentName IS NOT NULL OR is_deleted = 1)" +
         ")"
@@ -236,15 +252,15 @@ public class BrowserTable: Table {
      * We need to explicitly store what's provided by the server, because we can't rely on
      * referenced child nodes to exist yet!
      */
-    func getBookmarksMirrorStructureTableCreationString(forVersion version: Int = BrowserTable.DefaultVersion) -> String? {
+    func getBookmarksStructureTableCreationStringForTable(table: String, referencingMirror mirror: String, forVersion version: Int = BrowserTable.DefaultVersion) -> String? {
         if version < 10 {
             return nil
         }
 
         // TODO: index me.
         let sql =
-        "CREATE TABLE IF NOT EXISTS \(TableBookmarksMirrorStructure) " +
-        "( parent TEXT NOT NULL REFERENCES \(TableBookmarksMirror)(guid) ON DELETE CASCADE" +
+        "CREATE TABLE IF NOT EXISTS \(table) " +
+        "( parent TEXT NOT NULL REFERENCES \(mirror)(guid) ON DELETE CASCADE" +
         ", child TEXT NOT NULL" +      // Should be the GUID of a child.
         ", idx INTEGER NOT NULL" +     // Should advance from 0.
         ")"
@@ -329,21 +345,18 @@ public class BrowserTable: Table {
         "\(TableHistory), \(ViewWidestFaviconsForSites) AS icons WHERE " +
         "\(TableHistory).id = icons.siteID "
 
-        let bookmarks =
-        "CREATE TABLE IF NOT EXISTS \(TableBookmarks) (" +
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
-        "guid TEXT NOT NULL UNIQUE, " +
-        "type TINYINT NOT NULL, " +
-        "url TEXT, " +
-        "parent INTEGER REFERENCES \(TableBookmarks)(id) NOT NULL, " +
-        "faviconID INTEGER REFERENCES \(TableFavicons)(id) ON DELETE SET NULL, " +
-        "title TEXT" +
-        ") "
+        let bookmarksLocal = getBookmarksTableCreationStringForTable(TableBookmarksLocal, withAdditionalColumns: "")
+        let bookmarksLocalStructure = getBookmarksStructureTableCreationStringForTable(TableBookmarksLocalStructure, referencingMirror: TableBookmarksLocal)
+        let bookmarksBuffer = getBookmarksTableCreationStringForTable(TableBookmarksBuffer, withAdditionalColumns: self.mirrorColumns)
+        let bookmarksBufferStructure = getBookmarksStructureTableCreationStringForTable(TableBookmarksBufferStructure, referencingMirror: TableBookmarksBuffer)
+        let bookmarksMirror = getBookmarksTableCreationStringForTable(TableBookmarksMirror, withAdditionalColumns: self.mirrorColumns)
+        let bookmarksMirrorStructure = getBookmarksStructureTableCreationStringForTable(TableBookmarksMirrorStructure, referencingMirror: TableBookmarksMirror)
 
-        let bookmarksMirror = getBookmarksMirrorTableCreationString()
-        let bookmarksMirrorStructure = getBookmarksMirrorStructureTableCreationString()
-
-        let indexStructureParentIdx = "CREATE INDEX IF NOT EXISTS \(IndexBookmarksMirrorStructureParentIdx) " +
+        let indexLocalStructureParentIdx = "CREATE INDEX IF NOT EXISTS \(IndexBookmarksLocalStructureParentIdx) " +
+            "ON \(TableBookmarksLocalStructure) (parent, idx)"
+        let indexBufferStructureParentIdx = "CREATE INDEX IF NOT EXISTS \(IndexBookmarksBufferStructureParentIdx) " +
+            "ON \(TableBookmarksBufferStructure) (parent, idx)"
+        let indexMirrorStructureParentIdx = "CREATE INDEX IF NOT EXISTS \(IndexBookmarksMirrorStructureParentIdx) " +
             "ON \(TableBookmarksMirrorStructure) (parent, idx)"
 
         let queries: [(String?, Args?)] = [
@@ -351,10 +364,15 @@ public class BrowserTable: Table {
             (getHistoryTableCreationString(forVersion: version), nil),
             (favicons, nil),
             (visits, nil),
-            (bookmarks, nil),
+            (bookmarksBuffer, nil),
+            (bookmarksBufferStructure, nil),
+            (bookmarksLocal, nil),
+            (bookmarksLocalStructure, nil),
             (bookmarksMirror, nil),
             (bookmarksMirrorStructure, nil),
-            (indexStructureParentIdx, nil),
+            (indexBufferStructureParentIdx, nil),
+            (indexLocalStructureParentIdx, nil),
+            (indexMirrorStructureParentIdx, nil),
             (faviconSites, nil),
             (indexShouldUpload, nil),
             (indexSiteIDDate, nil),
@@ -434,13 +452,13 @@ public class BrowserTable: Table {
         }
 
         if from < 9 && to >= 9 {
-            if !self.run(db, sql: getBookmarksMirrorTableCreationString(forVersion: to)!) {
+            if !self.run(db, sql: getBookmarksTableCreationStringForTable(TableBookmarksMirror, forVersion: to)!) {
                 return false
             }
         }
 
         if from < 10 && to >= 10 {
-            if !self.run(db, sql: getBookmarksMirrorStructureTableCreationString(forVersion: to)!) {
+            if !self.run(db, sql: getBookmarksStructureTableCreationStringForTable(TableBookmarksMirrorStructure, referencingMirror: TableBookmarksMirror, forVersion: to)!) {
                 return false
             }
 
@@ -455,6 +473,20 @@ public class BrowserTable: Table {
             if !self.runValidQueries(db, queries: [(getTopSitesTableCreationString(forVersion: to), nil)]) {
                 return false
             }
+        }
+
+        if from < 12 && to >= 12 {
+            let _ =
+            "INSERT INTO \(TableBookmarksLocal) (id, guid, type, bmkUri, title, parentid, parentName) " +
+            "SELECT id, guid, type, url, title, " +
+            "(SELECT guid FROM \(_TableBookmarks) AS b WHERE b.id = id LIMIT 1), " +
+            "(SELECT title FROM \(_TableBookmarks) AS b WHERE b.id = id LIMIT 1)"
+            // TODO:
+            // Drop indices.
+            // Move bookmarksMirror* to bookmarksBuffer.
+            // Move bookmarks to bookmarksLocal and create structure as needed.
+            // Recreate indices.
+            // Trigger a sync?
         }
 
         return true
